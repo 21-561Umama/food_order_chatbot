@@ -2,6 +2,7 @@
 import json
 import subprocess
 import re
+import difflib
 
 # ---------------- Menu (local, authoritative prices) ----------------
 MENU = {
@@ -17,21 +18,14 @@ MENU = {
     "Chocolate Cake": {"small": 2.99, "medium": 4.99, "large": 6.99},
 }
 
-# ---------------- In-memory session state ----------------
-session = {
-    "cart": [],  # list of dicts {item, size, qty, price}
-    "name": None,
-    "delivery": None
-}
-
 # ---------------- Utilities ----------------
 def format_menu():
     lines = []
     for dish, sizes in MENU.items():
         lines.append(f"{dish}: " + ", ".join([f"{sz} ${pr:.2f}" for sz, pr in sizes.items()]))
-    return "\n".join(lines)
+    return "\n\n".join(lines)
 
-def view_cart_text():
+def view_cart_text(session):
     if not session["cart"]:
         return "Your cart is empty."
     lines = []
@@ -43,7 +37,7 @@ def view_cart_text():
     lines.append(f"TOTAL: ${total:.2f}")
     return "\n".join(lines)
 
-def add_to_cart(item, size, qty):
+def add_to_cart(session, item, size, qty):
     # normalize inputs
     if not item:
         return False, "No item provided."
@@ -63,7 +57,7 @@ def add_to_cart(item, size, qty):
     session["cart"].append({"item": item, "size": size, "qty": qty, "price": price})
     return True, f"Added {qty} x {size} {item}."
 
-def remove_from_cart(index):
+def remove_from_cart(session, index):
     # index is 1-based in messages
     try:
         idx = int(index) - 1
@@ -74,11 +68,23 @@ def remove_from_cart(index):
     except Exception:
         return False, "Failed to remove item. Provide the item number from the cart."
 
-def update_cart(index, new_size=None, new_qty=None):
+def update_cart(session, index=None, item_name=None, new_size=None, new_qty=None):
     try:
-        idx = int(index) - 1
+        idx = -1
+        if index is not None:
+            idx = int(index) - 1
+        elif item_name is not None:
+            cart_item_names = [item["item"].lower() for item in session["cart"]]
+            matches = difflib.get_close_matches(item_name.lower(), cart_item_names, n=1, cutoff=0.6)
+            if matches:
+                for i, item in enumerate(session["cart"]):
+                    if item["item"].lower() == matches[0]:
+                        idx = i
+                        break
+        
         if idx < 0 or idx >= len(session["cart"]):
-            return False, "Invalid item number to update."
+            return False, "Invalid item to update."
+
         entry = session["cart"][idx]
         if new_size:
             if new_size not in MENU[entry["item"]]:
@@ -90,11 +96,11 @@ def update_cart(index, new_size=None, new_qty=None):
             if q <= 0:
                 return False, "Quantity must be 1 or greater."
             entry["qty"] = q
-        return True, f"Updated item {index}."
+        return True, f"Updated item {idx + 1}."
     except Exception:
-        return False, "Failed to update. Check item number, size, and quantity."
+        return False, "Failed to update. Check item, size, and quantity."
 
-def clear_cart():
+def clear_cart(session):
     session["cart"].clear()
     return "Cart cleared."
 
@@ -132,7 +138,7 @@ def parse_with_gemini(text):
         tx = text.lower().strip()
 
         # direct commands
-        if "menu" in tx and len(tx.split()) <= 2:
+        if "menu" in tx:
             return {"action": "menu"}
         if "cart" in tx or "show cart" in tx or "view cart" in tx:
             return {"action": "show"}
@@ -168,15 +174,34 @@ def parse_with_gemini(text):
                 res["qty"] = int(qty)
             return res
 
+        mup_by_name = re.search(r"(?:update|change)\s+(.+?)\s+to\s+(small|medium|large)", tx)
+        if mup_by_name:
+            item_name = mup_by_name.group(1).strip()
+            size = mup_by_name.group(2).strip()
+            return {"action": "update", "item_name": item_name, "size": size}
+
         # add pattern: "I want 2 medium cheeseburgers" or "add 1 small cheeseburger"
-        madd = re.search(r"(\badd\b|i want|i'd like|i want to order|order)\s*(?:a|an|the)?\s*(\d+)?\s*(small|medium|large)?\s*([a-zA-Z ]+)", tx)
+        madd = re.search(r"(?:\badd\b|get me|i want|i'd like|i want to order|order)\s*(?:a|an|the)?\s*(\d+|a|an)?\s*(small|medium|large)?\s*([a-zA-Z\s]+)", tx)
         if madd:
-            qty = int(madd.group(2)) if madd.group(2) else 1
-            size = madd.group(3) or "medium"
-            item = madd.group(4).strip().title()
-            # try to singularize/plural check crudely
-            item = item.rstrip('s')
+            qty_str = madd.group(1)
+            if qty_str in ["a", "an"]:
+                qty = 1
+            elif qty_str:
+                qty = int(qty_str)
+            else:
+                qty = 1
+            size = madd.group(2) or "medium"
+            item = madd.group(3).strip().title()
+            if item not in MENU and item.endswith('s'):
+                singular_item = item.rstrip('s')
+                if singular_item in MENU:
+                    item = singular_item
             return {"action": "add", "item": item, "size": size, "qty": qty}
+
+        # check if the message is a menu item
+        for item_name in MENU:
+            if tx == item_name.lower():
+                return {"action": "add", "item": item_name, "size": "medium", "qty": 1}
 
         # fallback unknown
         return {"action": "unknown", "raw": text}
